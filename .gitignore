@@ -4,13 +4,13 @@ venv/
 __pycache__/
 *.pyc
 
-
 *.pt
-
 
 storage/thumbnails/*
 !storage/thumbnails/.gitkeep
 
+storage/clips/*
+!storage/clips/.gitkeep
 
 .env
 .vscode/
