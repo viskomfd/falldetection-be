@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 
 *.pt
+!yolo11_rumi.pt
 
 storage/thumbnails/*
 !storage/thumbnails/.gitkeep
