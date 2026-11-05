@@ -19,9 +19,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def load_shared_yolo_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_path = os.path.join(BASE_DIR, "..", "yolo11n-pose.pt")
-    if not os.path.exists(model_path):
-        model_path = "yolo11n-pose.pt"
+    
+    # Prioritaskan env var, lalu yolo11_rumi.pt, kemudian fallback ke yolo11n-pose.pt
+    custom_model_env = os.getenv("YOLO_MODEL_PATH")
+    candidate_paths = [
+        custom_model_env,
+        os.path.join(BASE_DIR, "..", "yolo11_rumi.pt"),
+        os.path.join(BASE_DIR, "yolo11_rumi.pt"),
+        "yolo11_rumi.pt",
+        os.path.join(BASE_DIR, "..", "yolo11n-pose.pt"),
+        os.path.join(BASE_DIR, "yolo11n-pose.pt"),
+        "yolo11n-pose.pt"
+    ]
+    
+    # Ambil jalur pertama yang valid dan ada di filesystem
+    model_path = next((p for p in candidate_paths if p and os.path.exists(p)), "yolo11_rumi.pt")
+    
     print(f"[SUPERVISOR] Memuat shared model YOLO ({device}): {model_path}")
     return YOLO(model_path).to(device)
 

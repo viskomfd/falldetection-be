@@ -25,9 +25,9 @@ CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.15"))
 ASPECT_RATIO_THRESHOLD = 0.55        # Lebar vs Tinggi kotak untuk indikasi rebah menyamping
 LONGITUDINAL_AR_THRESHOLD = 0.40     # Ambang rasio saat orang rebah membujur
 TORSO_ANGLE_THRESHOLD = 45.0         # Kemiringan torso (> 45 derajat dari vertikal)
-VERTICAL_VELOCITY_THRESHOLD = 8.0    # Kecepatan turun instan antar-frame (px/frame)
-SLOW_FALL_DROP_THRESHOLD = 28.0      # Total penurunan vertikal (px) dalam window
-INACTIVITY_SECONDS = float(os.getenv("INACTIVITY_SECONDS", "0.8"))
+VERTICAL_VELOCITY_THRESHOLD = 14.0   # Kecepatan turun instan antar-frame (px/frame, kompensasi 10 FPS)
+SLOW_FALL_DROP_THRESHOLD = 45.0      # Total penurunan vertikal (px) dalam window
+INACTIVITY_SECONDS = float(os.getenv("INACTIVITY_SECONDS", "1.2"))
 POSTURE_WINDOW = 5                   # Window voting
 POSTURE_VOTE_RATIO = 0.4             # Minimal 2 dari 5 frame konsisten
 SAME_SPOT_COOLDOWN = 4.0             # Mencegah spam alert pada titik koordinat yang sama
@@ -222,6 +222,13 @@ class PersonTracker:
         self.last_seen_time = time.time()
         self.alert_sent = False
 
+        # State Machine Flags untuk validasi riwayat jatuh
+        self.has_been_upright = False
+        self.last_fall_motion_time = 0.0
+        self.fall_confirmed_latch = False
+        self.suspect_grace_until = 0.0
+        self.is_longitudinal_fall = False
+
     def update_posture_flag(self, is_fall_posture):
         self.posture_flags.append(is_fall_posture)
         if len(self.posture_flags) < 2:
@@ -263,7 +270,7 @@ class PersonTracker:
         drop_box = (self.box_y_history[-1] - min(self.box_y_history)) if len(self.box_y_history) >= 3 else 0.0
         return max(drop_hip, drop_box)
 
-    def is_inactive(self, current_box, movement_threshold=65):
+    def is_inactive(self, current_box, movement_threshold=25):
         if self.last_center is None:
             return True
         current_center = get_box_center(current_box)
@@ -384,14 +391,27 @@ class FallDetectionWorker:
         self.is_running = False
         self.worker_thread = None
 
+        # Memori global ruangan untuk mengatasi ByteTrack ID Switching saat jatuh
+        self.room_last_upright_time = 0.0
+        self.room_last_motion_time = 0.0
+
         # Shared YOLO model atau inisialisasi lokal
         if model_instance is not None:
             self.model = model_instance
         else:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            model_path = os.path.join(BASE_DIR, "..", "yolo11n-pose.pt")
-            if not os.path.exists(model_path):
-                model_path = "yolo11n-pose.pt"
+            custom_model_env = os.getenv("YOLO_MODEL_PATH")
+            candidate_paths = [
+                custom_model_env,
+                os.path.join(BASE_DIR, "..", "yolo11_rumi.pt"),
+                os.path.join(BASE_DIR, "yolo11_rumi.pt"),
+                "yolo11_rumi.pt",
+                os.path.join(BASE_DIR, "..", "yolo11n-pose.pt"),
+                os.path.join(BASE_DIR, "yolo11n-pose.pt"),
+                "yolo11n-pose.pt"
+            ]
+            model_path = next((p for p in candidate_paths if p and os.path.exists(p)), "yolo11_rumi.pt")
+            print(f"[WORKER] Memuat model YOLO lokal ({device}): {model_path}")
             self.model = YOLO(model_path).to(device)
 
     def _report_status(self, status: str):
@@ -470,14 +490,16 @@ class FallDetectionWorker:
                 time.sleep(0.005)
                 continue
 
-            # 1. SCENE CUT DETECTION
+            # 1. SCENE CUT DETECTION (Sensitivitas 12.0 untuk transisi klip dalam ruangan yang sama)
             small_gray = cv2.cvtColor(cv2.resize(frame, (64, 36)), cv2.COLOR_BGR2GRAY)
             if prev_small_gray is not None:
                 scene_diff = np.mean(cv2.absdiff(small_gray, prev_small_gray))
-                if scene_diff > 32.0:
+                if scene_diff > 12.0:
                     trackers.clear()
                     last_alert_pos = None
                     last_alert_time = 0.0
+                    self.room_last_upright_time = 0.0
+                    self.room_last_motion_time = 0.0
             prev_small_gray = small_gray
 
             # 2. INFERENSI POSE & TRACKING
@@ -506,12 +528,12 @@ class FallDetectionWorker:
                     box_w = box[2] - box[0]
                     box_h = box[3] - box[1]
 
-                    # 3. SPATIAL ID RE-LINKING
+                    # 3. SPATIAL ID RE-LINKING (Radius 160px agar tidak terputus saat jatuh membujur)
                     if raw_track_id not in trackers:
                         inherited_tracker = None
-                        min_dist = 145.0
+                        min_dist = 160.0
                         for old_id, old_tracker in list(trackers.items()):
-                            if old_id not in track_ids and (current_time - old_tracker.last_seen_time) < 2.5:
+                            if old_id not in track_ids and (current_time - old_tracker.last_seen_time) < 3.0:
                                 if old_tracker.last_center is not None:
                                     dist = math.dist(box_center, old_tracker.last_center)
                                     if dist < min_dist:
@@ -520,6 +542,8 @@ class FallDetectionWorker:
 
                         if inherited_tracker is not None:
                             old_id, tracker_obj = inherited_tracker
+                            tracker_obj.display_id = raw_track_id
+                            tracker_obj.last_seen_time = current_time
                             del trackers[old_id]
                             trackers[raw_track_id] = tracker_obj
                         else:
@@ -554,65 +578,110 @@ class FallDetectionWorker:
                             else:
                                 is_upper_body_upright = True
 
+                    # Inisialisasi variabel kinematika & orientasi
+                    torso_angle = None
+                    total_drop = tracker.total_vertical_drop()
+                    v_velocity = tracker.vertical_velocity()
                     inactive = tracker.is_inactive(box)
                     tracker.update_state(box, hip_pos)
-                    v_velocity = tracker.vertical_velocity()
-                    total_drop = tracker.total_vertical_drop()
 
-                    # 4. LOGIKA EVALUASI JATUH
-                    if hip_pos is None:
-                        if is_upper_body_upright:
-                            raw_posture_flag = False
-                            tracker.posture_flags.clear()
+                    ankle_pos = get_valid_point(kpts, person_kpts, L_ANKLE, R_ANKLE, 0.20)
+                    has_valid_torso = (shoulder_pos is not None and hip_pos is not None)
+                    if has_valid_torso:
+                        torso_angle = calc_torso_angle(shoulder_pos, hip_pos)
+
+                    # 1. ANALISIS PERSPEKTIF RUANGAN (Identifikasi Jatuh Membujur ke Arah Kamera)
+                    # Pada CCTV sudut atas, orang yang jatuh membujur ke arah kamera akan berada di lantai bawah
+                    # (box[3] > 0.68 * frame_h), namun pucuk badannya tidak menjulang ke atas (box[1] > 0.38 * frame_h).
+                    # Orang yang benar-benar berdiri di zona depan pasti menjulang tinggi (box[1] < 0.35 * frame_h).
+                    is_longitudinal_floor_pose = (box[3] > (frame_h * 0.68)) and (box[1] > (frame_h * 0.38))
+
+                    # 2. HUKUM ANATOMI VERTIKAL (Validasi Berdiri Tegak & Duduk Normal)
+                    # HANYA valid jika subjek BUKAN dalam posisi rebah longitudinal di lantai!
+                    is_anatomically_upright = False
+                    if not is_longitudinal_floor_pose and has_valid_torso:
+                        shoulder_above_hip = (hip_pos[1] - shoulder_pos[1]) > (box_h * 0.12)
+                        hip_above_lower = False
+                        if ankle_pos is not None:
+                            hip_above_lower = (ankle_pos[1] - hip_pos[1]) > (box_h * 0.12)
+                        elif knee_pos is not None:
+                            hip_above_lower = (knee_pos[1] - hip_pos[1]) > (box_h * 0.08)
                         else:
-                            if aspect_ratio > 0.85 or total_drop > SLOW_FALL_DROP_THRESHOLD or tracker.fall_suspected_since is not None:
-                                raw_posture_flag = True
+                            hip_above_lower = True
+
+                        if shoulder_above_hip and hip_above_lower:
+                            if torso_angle is not None and torso_angle < 32.0 and aspect_ratio < 0.60:
+                                is_anatomically_upright = True
+                            elif aspect_ratio < 0.72 and (torso_angle is not None and torso_angle < 38.0):
+                                is_anatomically_upright = True
+
+                    # 3. DETEKSI LONJAKAN KINETIKA JATUH
+                    has_kinetic_drop = (
+                        v_velocity > VERTICAL_VELOCITY_THRESHOLD
+                        or total_drop > SLOW_FALL_DROP_THRESHOLD
+                        or (tracker.max_upright_height > 0 and box_h < tracker.max_upright_height * 0.60)
+                    )
+
+                    if has_kinetic_drop and tracker.has_been_upright:
+                        tracker.last_fall_motion_time = current_time
+                        tracker.suspect_grace_until = current_time + 3.5
+                        self.room_last_motion_time = current_time
+
+                    recent_drop = (current_time - tracker.last_fall_motion_time) <= 4.0
+                    in_grace_period = current_time < tracker.suspect_grace_until
+
+                    # 4. IDENTIFIKASI POSTUR TERGELETAK DI LANTAI
+                    is_floor_posture = False
+                    if is_longitudinal_floor_pose:
+                        is_floor_posture = True
+                    elif not is_anatomically_upright:
+                        # Jatuh membujur: bahu berada sejajar atau lebih rendah di layar daripada pinggul
+                        if has_valid_torso and shoulder_pos[1] >= (hip_pos[1] - 8):
+                            is_floor_posture = True
+                        # Jatuh melintang / miring
+                        elif torso_angle is not None and torso_angle > TORSO_ANGLE_THRESHOLD:
+                            is_floor_posture = True
+                        elif aspect_ratio > 0.75:
+                            is_floor_posture = True
+                        # Bounding box kolaps drastis dibanding tinggi saat berdiri
+                        elif tracker.max_upright_height > 0 and box_h < (tracker.max_upright_height * 0.60):
+                            is_floor_posture = True
+
+                    # 5. KEPUTUSAN STATE MACHINE
+                    # Deteksi jatuh adalah PERISTIWA (Event), BUKAN sekadar postur statis.
+                    # Harus ada riwayat transisi kinetik (drop/motion) dari subjek atau level ruangan.
+                    room_recent_fall = (
+                        (current_time - self.room_last_motion_time <= 4.0)
+                        and (current_time - self.room_last_upright_time <= 8.0)
+                    )
+                    has_fall_dynamics = recent_drop or in_grace_period or room_recent_fall
+
+                    if is_anatomically_upright:
+                        # Subjek terverifikasi berdiri/duduk tegak: RESET SEMUA INDIKASI JATUH
+                        tracker.has_been_upright = True
+                        if box_h > tracker.max_upright_height:
+                            tracker.max_upright_height = box_h
+                        self.room_last_upright_time = current_time
+                        tracker.fall_confirmed_latch = False
+                        tracker.fall_suspected_since = None
+                        tracker.suspect_grace_until = 0.0
+                        tracker.alert_sent = False
+                        tracker.posture_flags.clear()
+                        raw_posture_flag = False
                     else:
-                        if shoulder_pos is not None:
-                            torso_angle = calc_torso_angle(shoulder_pos, hip_pos)
-                            torso_len = math.dist(shoulder_pos, hip_pos)
-
-                            hip_near_ground = False
-                            if knee_pos is not None and abs(hip_pos[1] - knee_pos[1]) < (box_h * 0.24):
-                                hip_near_ground = True
-
-                            head_collapsed = (nose_conf > 0.30 and kpts[NOSE][1] >= (shoulder_pos[1] - box_h * 0.04))
-                            body_foreshortened = (torso_len < box_w * 0.75) and (aspect_ratio > LONGITUDINAL_AR_THRESHOLD)
-                            in_floor_zone = (box[1] > frame_h * 0.35)
-
-                            is_longitudinal_floor_pose = (
-                                in_floor_zone
-                                and aspect_ratio > LONGITUDINAL_AR_THRESHOLD
-                                and (head_collapsed or body_foreshortened or hip_near_ground or torso_angle > 22.0)
-                            )
-                            is_slow_fall = (total_drop > SLOW_FALL_DROP_THRESHOLD) and (
-                                aspect_ratio > LONGITUDINAL_AR_THRESHOLD or torso_angle > 22.0 or hip_near_ground
-                            )
-
-                            if (
-                                torso_angle < 18.0
-                                and aspect_ratio < LONGITUDINAL_AR_THRESHOLD
-                                and not hip_near_ground
-                                and not head_collapsed
-                            ):
-                                raw_posture_flag = False
-                                tracker.posture_flags.clear()
-                            elif torso_angle > TORSO_ANGLE_THRESHOLD:
-                                raw_posture_flag = True
-                            elif aspect_ratio > ASPECT_RATIO_THRESHOLD and (
-                                torso_angle > 20.0 or hip_near_ground or v_velocity > VERTICAL_VELOCITY_THRESHOLD or in_floor_zone
-                            ):
-                                raw_posture_flag = True
-                            elif v_velocity > VERTICAL_VELOCITY_THRESHOLD and (
-                                aspect_ratio > LONGITUDINAL_AR_THRESHOLD or torso_angle > 22.0 or hip_near_ground
-                            ):
-                                raw_posture_flag = True
-                            elif is_slow_fall or is_longitudinal_floor_pose:
-                                raw_posture_flag = True
+                        if tracker.fall_confirmed_latch:
+                            # Jika sudah terkonfirmasi jatuh sebelumnya, kunci status selama belum berdiri
+                            raw_posture_flag = True
+                        elif is_floor_posture and has_fall_dynamics:
+                            # Postur rebah di lantai HANYA menjadi indikasi jatuh jika ada riwayat transisi kinetik
+                            raw_posture_flag = True
+                        elif has_kinetic_drop and tracker.has_been_upright:
+                            raw_posture_flag = True
                         else:
-                            if aspect_ratio > LONGITUDINAL_AR_THRESHOLD and (box[1] > frame_h * 0.35):
-                                raw_posture_flag = True
+                            # Orang sedang tidur/rebahan santai tanpa peristiwa jatuh: Tetap Normal
+                            raw_posture_flag = False
 
+                    # 5. TEMPORAL BUFFER & INACTIVITY CONFIRMATION
                     posture_indicates_fall = tracker.update_posture_flag(raw_posture_flag)
 
                     status_text = "Normal"
@@ -623,8 +692,10 @@ class FallDetectionWorker:
 
                         duration = current_time - tracker.fall_suspected_since
 
-                        if duration >= INACTIVITY_SECONDS and inactive:
+                        # Kunci status FALL DETECTED jika inaktif di lantai atau latch aktif
+                        if (duration >= INACTIVITY_SECONDS and inactive) or tracker.fall_confirmed_latch:
                             status_text = "FALL DETECTED"
+                            tracker.fall_confirmed_latch = True
                             if not tracker.alert_sent:
                                 is_same_spot_spam = (
                                     last_alert_pos is not None
@@ -633,7 +704,6 @@ class FallDetectionWorker:
                                 )
                                 if not is_same_spot_spam:
                                     print(f"[FALL DETECTED] Person #{tracker.display_id} di '{self.camera_name}'!")
-                                    # Snapshot dengan bounding box
                                     snapshot_img = frame.copy()
                                     x1, y1, x2, y2 = [int(v) for v in box]
                                     cv2.rectangle(snapshot_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -647,7 +717,6 @@ class FallDetectionWorker:
                                         2
                                     )
 
-                                    # Siapkan perekaman post-fall context untuk klip video
                                     post_fall_recording = True
                                     post_fall_frames = []
                                     pending_incident = {
@@ -662,8 +731,9 @@ class FallDetectionWorker:
                         elif tracker.alert_sent:
                             status_text = "FALL DETECTED"
                     else:
-                        tracker.fall_suspected_since = None
-                        tracker.alert_sent = False
+                        if not tracker.fall_confirmed_latch:
+                            tracker.fall_suspected_since = None
+                            tracker.alert_sent = False
 
                     if self.debug_gui and annotated_frame is not None:
                         x1, y1 = int(box[0]), int(box[1])
@@ -682,7 +752,7 @@ class FallDetectionWorker:
             # Bersihkan tracker kadaluarsa
             for raw_id, tracker in list(trackers.items()):
                 if raw_id not in active_ids:
-                    if (current_time - tracker.last_seen_time) > 2.5:
+                    if (current_time - tracker.last_seen_time) > 3.0:
                         del trackers[raw_id]
 
             if self.debug_gui and annotated_frame is not None:
